@@ -89,16 +89,21 @@ def load_oxford_to_db():
 def get_db():
     return sqlite3.connect(DB_FILE)
 
-# 使用 cache_data 與 try-except 避免重複請求與 Error 500 報錯
+# 使用 cache_data 與強效防錯機制，徹底攔截 Error 500 訊息
 @st.cache_data(show_spinner=False)
 def get_translation(word):
-    """即時線上中文翻譯 (含防錯機制)"""
+    """即時線上中文翻譯 (含 Error 500 攔截機制)"""
     try:
-        time.sleep(0.05)  # 微小延遲保護 API 限流
+        time.sleep(0.1)  # 微小延遲保護 API
         translated = GoogleTranslator(source='auto', target='zh-TW').translate(word)
-        return translated if translated else "暫無翻譯"
+        
+        # 關鍵攔截：若 Google 回傳包含 Error 500 或 HTML 錯誤標籤，直接過濾掉
+        if not translated or "Error 500" in translated or "Server Error" in translated or "<html" in translated.lower():
+            return "暫無法取得翻譯 (請重試)"
+            
+        return translated
     except Exception:
-        return "暫無法取得翻譯"
+        return "暫無法取得翻譯 (請重試)"
 
 # 頁面配置與隱藏錨點圖示
 st.set_page_config(page_title="英文單字學習助手", page_icon="📖", layout="centered")

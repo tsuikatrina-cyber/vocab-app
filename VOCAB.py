@@ -96,18 +96,6 @@ def get_translation(word):
         pass
     return "查無翻譯"
 
-def get_smart_placeholder(target_word, definition):
-    """根據詞性給出合理的提示例句"""
-    defn = definition.lower()
-    if '[n.]' in defn or 'n.' in defn:
-        return f"例如: Learning about {target_word} is important for us..."
-    elif '[v.]' in defn or 'v.' in defn:
-        return f"例如: I try to {target_word} whenever I have free time..."
-    elif '[adj.]' in defn or 'adj.' in defn:
-        return f"例如: It was a very {target_word} moment for everyone..."
-    else:
-        return f"請輸入包含 『{target_word}』 的完整英文句子..."
-
 def evaluate_sentence_ai(target_word, user_sentence):
     sentence = user_sentence.strip()
     if not sentence:
@@ -152,7 +140,7 @@ def evaluate_sentence_ai(target_word, user_sentence):
             return {
                 "passed": False,
                 "score": 60,
-                "feedback": f"⚠️ **單字使用正確，但文法有些小瑕疵：**\n\n{sugg_text}\n\n- 再調整一下句子讓表達更完整吧！",
+                "feedback": f"⚠️ **單字使用正確，但文法有些小瑕疵：**\n\n{sugg_text}\n\n- 再調整一下句子讓表達更完美吧！",
                 "delta": -1
             }
             
@@ -280,11 +268,11 @@ elif menu == "✍️ AI 英文造句特訓":
         st.markdown(f"### 🎯 請用單字： **`{target_word}`** 造句")
         st.caption(f"📖 單字釋義：{target_def} ｜ ⭐ 目前熟悉度：`{fam}`")
 
-        # 動態生成正確對應詞性的預設提示
-        placeholder_text = get_smart_placeholder(target_word, target_def)
+        # 使用乾淨且不具誤導性的提示文字
+        clean_placeholder = f"請在此輸入包含 『{target_word}』 的完整英文句子..."
 
         with st.form(key="sentence_form"):
-            user_sentence = st.text_area("請輸入你造的英文句子：", placeholder=placeholder_text, key="user_sent_input")
+            user_sentence = st.text_area("請輸入你造的英文句子：", placeholder=clean_placeholder, key="user_sent_input")
             submit_sent_btn = st.form_submit_button("🤖 提交給 AI 批改評價", use_container_width=True)
 
             if submit_sent_btn:

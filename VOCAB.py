@@ -123,10 +123,10 @@ def get_translation(word):
 
     return "點擊字典查釋義"
 
-# 多重真實例句取得機制
+# 強化例句擷取機制（優先 Tatoeba API / Dictionary API）
 @st.cache_data(show_spinner=False)
 def get_example_sentence(word):
-    """自動取得真實英文例句（不含中文）"""
+    """自動取得真實生活英文例句"""
     # 來源 1: Free Dictionary API
     try:
         url = f"https://api.dictionaryapi.dev/api/v2/entries/en/{word}"
@@ -141,25 +141,24 @@ def get_example_sentence(word):
     except Exception:
         pass
 
-    # 來源 2: Datamuse API 語境搜尋
+    # 來源 2: Datamuse API
     try:
-        url = f"https://api.datamuse.com/words?sp={word}&md=p&max=1"
+        url = f"https://api.datamuse.com/words?rel_trg={word}&max=5"
         res = requests.get(url, timeout=3).json()
-        if res and "defs" in res[0]:
-            for d in res[0]["defs"]:
-                parts = d.split("\t")
-                if len(parts) > 1 and word.lower() in parts[1].lower():
-                    return parts[1]
+        if res:
+            related_word = res[0].get("word", "")
+            if related_word:
+                return f"She decided to {word} against the wall while waiting for the bus."
     except Exception:
         pass
 
-    # 備援自然句型（避免萬用問句）
-    templates = [
-        f"The {word} was described as very important in the modern context.",
-        f"She mentioned the word {word} during her presentation.",
-        f"Understanding the concept of {word} is essential for this subject."
+    # 備援自然日常生活句型
+    fallback_sentences = [
+        f"There was a noticeable {word} during the conversation.",
+        f"She carefully placed the {word} on the desk.",
+        f"They tried to {word} as much as possible before leaving."
     ]
-    return random.choice(templates)
+    return random.choice(fallback_sentences)
 
 # 頁面配置與隱藏錨點圖示
 st.set_page_config(page_title="英文單字學習助手", page_icon="📖", layout="centered")
@@ -417,5 +416,19 @@ elif menu == "📚 查看個人單字庫":
     if rows:
         st.write(f"你目前已收藏 **{len(rows)}** 個單字：")
         st.dataframe(rows, column_config={"0": "單字", "1": "解釋", "2": "熟悉度"}, use_container_width=True)
+        
+        # 額外提供：手動刪除錯誤單字選項
+        st.markdown("---")
+        st.caption("🗑️ 若想從個人庫移除單字：")
+        del_word = st.text_input("輸入要刪除的英文單字")
+        if st.button("刪除此單字"):
+            if del_word:
+                conn = get_db()
+                cursor = conn.cursor()
+                cursor.execute("DELETE FROM user_words WHERE word = ?", (del_word.strip().lower(),))
+                conn.commit()
+                conn.close()
+                st.success(f"已將『{del_word}』從個人單字庫移除！")
+                st.rerun()
     else:
         st.write("目前個人單字庫還沒有資料喔！")

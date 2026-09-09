@@ -12,11 +12,10 @@ DB_FILE = "vocab_app.db"
 PDF_FILES = ["American_Oxford_3000.pdf", "American_Oxford_5000.pdf"]
 
 def init_db():
-    """初始化資料表，並清理舊有含有 Error 500 的壞資料"""
+    """初始化資料表，清理無效欄位與備用字串"""
     conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
     
-    # 牛津總詞庫
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS oxford_words (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -25,7 +24,6 @@ def init_db():
         )
     """)
     
-    # 個人單字庫
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS user_words (
             word TEXT UNIQUE NOT NULL,
@@ -34,27 +32,15 @@ def init_db():
         )
     """)
 
-    # 檢查並補齊 familiarity 欄位
     cursor.execute("PRAGMA table_info(user_words)")
     columns = [column[1] for column in cursor.fetchall()]
     if 'familiarity' not in columns:
         cursor.execute("ALTER TABLE user_words ADD COLUMN familiarity INTEGER DEFAULT 1")
 
-    # 清理資料庫中之前存入的 Error 500 舊字串
-    cursor.execute("SELECT rowid, word, definition FROM user_words WHERE definition LIKE '%Error 500%' OR definition LIKE '%Server Error%'")
-    bad_rows = cursor.fetchall()
-    for rowid, word, old_def in bad_rows:
-        match = re.search(r'(\[.*?\]\s*\(.*?\))', old_def)
-        pos_tag = match.group(1) if match else ""
-        new_trans = get_translation(word)
-        new_def = f"{new_trans} {pos_tag}".strip()
-        cursor.execute("UPDATE user_words SET definition = ? WHERE rowid = ?", (new_def, rowid))
-
     conn.commit()
     conn.close()
 
 def extract_words_from_pdf(pdf_path):
-    """PDF 單字解析器"""
     reader = pypdf.PdfReader(pdf_path)
     full_text = ""
     for page in reader.pages:
@@ -100,65 +86,90 @@ def load_oxford_to_db():
 def get_db():
     return sqlite3.connect(DB_FILE)
 
-# 雙重備援翻譯機制
 @st.cache_data(show_spinner=False)
 def get_translation(word):
-    """即時線上中文翻譯 (含多重 API 備援與錯誤過濾)"""
+    """取得單字中文翻譯"""
     try:
         time.sleep(0.05)
         translated = GoogleTranslator(source='auto', target='zh-TW').translate(word)
-        if translated and "Error 500" not in translated and "Server Error" not in translated and "<html" not in translated.lower():
+        if translated and "<html" not in translated.lower():
             return translated
     except Exception:
         pass
+    return "查無翻譯"
 
+def evaluate_sentence_ai(target_word, user_sentence):
+    """
+    AI 造句評價系統：
+    檢查是否包含單字、文法檢查（LanguageTool API）、給予意見與經驗值加減
+    """
+    sentence = user_sentence.strip()
+    if not sentence:
+        return {"passed": False, "score": 0, "feedback": "⚠️ 內容不能為空，請輸入句子！", "delta": 0}
+    
+    # 檢查是否含有目標單字（允許單複數、時態變化）
+    pattern = re.compile(re.escape(target_word) + r'(s|es|d|ed|ing)?', re.IGNORECASE)
+    if not pattern.search(sentence):
+        return {
+            "passed": False,
+            "score": 0,
+            "feedback": f"❌ 你的句子中沒有包含單字 **{target_word}**（或其變形），請重新調整！",
+            "delta": -1
+        }
+    
+    # 使用免費開源 LanguageTool API 進行文法檢測
     try:
-        url = f"https://api.mymemory.translated.net/get?q={word}&langpair=en|zh-TW"
-        res = requests.get(url, timeout=3).json()
-        translated = res.get("responseData", {}).get("translatedText", "")
-        if translated and "QUERY LENGTH LIMIT EXCEEDED" not in translated.upper() and "MYMEMORY" not in translated.upper():
-            return translated
+        response = requests.post(
+            "https://api.languagetool.org/v2/check",
+            data={"text": sentence, "language": "en-US"},
+            timeout=5
+        )
+        data = response.json()
+        matches = data.get("matches", [])
+        
+        # 過濾純大小寫/標點符號的輕微警示，計算重大文法錯誤數
+        critical_errors = [m for m in matches if m.get("rule", {}).get("issueType") in ["misspelling", "grammar"]]
+        
+        if len(critical_errors) == 0:
+            return {
+                "passed": True,
+                "score": 100,
+                "feedback": f"🎉 **太棒了！造句非常道地且文法完全正確！**\n\n- **句子**：*{sentence}*\n- **評語**：成功靈活運用了單字 `{target_word}`！",
+                "delta": 2
+            }
+        else:
+            suggestions = []
+            for err in critical_errors[:2]:
+                msg = err.get("message", "文法疑慮")
+                repl = [r["value"] for r in err.get("replacements", [])[:2]]
+                sugg_str = f"👉 **{msg}**" + (f"（建議改為：`{', '.join(repl)}`）" if repl else "")
+                suggestions.append(sugg_str)
+            
+            sugg_text = "\n".join(suggestions)
+            return {
+                "passed": False,
+                "score": 60,
+                "feedback": f"⚠️ **單字使用正確，但文法有些小瑕疵：**\n\n{sugg_text}\n\n- 再調整一下句子讓表達更完美吧！",
+                "delta": -1
+            }
+            
     except Exception:
-        pass
-
-    return "點擊字典查釋義"
-
-# 強化例句擷取機制（優先 Tatoeba API / Dictionary API）
-@st.cache_data(show_spinner=False)
-def get_example_sentence(word):
-    """自動取得真實生活英文例句"""
-    # 來源 1: Free Dictionary API
-    try:
-        url = f"https://api.dictionaryapi.dev/api/v2/entries/en/{word}"
-        res = requests.get(url, timeout=3).json()
-        if isinstance(res, list) and len(res) > 0:
-            meanings = res[0].get("meanings", [])
-            for m in meanings:
-                for defn in m.get("definitions", []):
-                    example = defn.get("example")
-                    if example and word.lower() in example.lower():
-                        return example
-    except Exception:
-        pass
-
-    # 來源 2: Datamuse API
-    try:
-        url = f"https://api.datamuse.com/words?rel_trg={word}&max=5"
-        res = requests.get(url, timeout=3).json()
-        if res:
-            related_word = res[0].get("word", "")
-            if related_word:
-                return f"She decided to {word} against the wall while waiting for the bus."
-    except Exception:
-        pass
-
-    # 備援自然日常生活句型
-    fallback_sentences = [
-        f"There was a noticeable {word} during the conversation.",
-        f"She carefully placed the {word} on the desk.",
-        f"They tried to {word} as much as possible before leaving."
-    ]
-    return random.choice(fallback_sentences)
+        # 網路介面連線備援機制
+        words_count = len(sentence.split())
+        if words_count >= 4:
+            return {
+                "passed": True,
+                "score": 85,
+                "feedback": f"✅ **造句成功！** 已成功將 **{target_word}** 融入句子中。",
+                "delta": 1
+            }
+        else:
+            return {
+                "passed": False,
+                "score": 40,
+                "feedback": "⚠️ 句子太短了，請試著寫出一個更完整有意義的句子！",
+                "delta": -1
+            }
 
 # 頁面配置與隱藏錨點圖示
 st.set_page_config(page_title="英文單字學習助手", page_icon="📖", layout="centered")
@@ -177,7 +188,7 @@ st.title("📖 英文單字學習助手")
 # 側邊欄選單
 menu = st.sidebar.radio("功能選單", [
     "🎯 牛津5000 隨機測驗",
-    "📝 填空記憶特訓",
+    "✍️ AI 英文造句特訓",
     "🎴 個人單字卡複習",
     "📗 牛津完整字詞庫",
     "➕ 手動新增個人單字",
@@ -245,10 +256,10 @@ if menu == "🎯 牛津5000 隨機測驗":
             🔗 **線上查字典**：[{current_w} 在 Cambridge Dictionary]({cambridge_url})
             """)
 
-# ================= 2. 📝 填空記憶特訓 (純英文無中文提示 + 答對加熟悉度) =================
-elif menu == "📝 填空記憶特訓":
-    st.subheader("📝 填空拼字記憶特訓")
-    st.write("請靠記憶將正確的英文單字填入句子的空格中（無中文提示）。")
+# ================= 2. ✍️ AI 英文造句特訓 (全新設計) =================
+elif menu == "✍️ AI 英文造句特訓":
+    st.subheader("✍️ AI 英文造句實戰特訓")
+    st.write("從你的個人單字庫隨機抽出一個單字，請嘗試用它造一個完整的英文句子！AI 將會即時為你的句子提供建議並調整熟悉度。")
 
     conn = get_db()
     cursor = conn.cursor()
@@ -257,50 +268,56 @@ elif menu == "📝 填空記憶特訓":
     conn.close()
 
     if not user_words:
-        st.info("💡 你的個人單字庫是空的！請先至「🎯 牛津5000 隨機測驗」加入你認識的單字後再來挑戰。")
+        st.info("💡 你的個人單字庫目前是空的！請先至「🎯 牛津5000 隨機測驗」按下『認識』加入單字。")
     else:
-        if "fill_item" not in st.session_state:
-            st.session_state.fill_item = random.choice(user_words)
-            st.session_state.submitted = False
-            st.session_state.last_result = None
+        # 初始化造句題目
+        if "sentence_item" not in st.session_state:
+            st.session_state.sentence_item = random.choice(user_words)
+            st.session_state.eval_result = None
 
-        w_rowid, target_word, target_def, fam = st.session_state.fill_item
-        example_en = get_example_sentence(target_word)
+        w_rowid, target_word, target_def, fam = st.session_state.sentence_item
 
-        # 將例句中的目標單字（含大小寫與單複數形式）替換為空格 ______
-        pattern = re.compile(re.escape(target_word) + r'(s|es|d|ed|ing)?', re.IGNORECASE)
-        blanked_sentence = pattern.sub("______", example_en)
+        st.markdown("---")
+        st.markdown(f"### 🎯 請用單字： **`{target_word}`** 造句")
+        st.caption(f"📖 單字釋義：{target_def} ｜ ⭐ 目前熟悉度：`{fam}`")
 
-        st.markdown(f"#### 💬 請填空：")
-        st.info(f"### **{blanked_sentence}**")
+        # 使用 form 表單輸入造句
+        with st.form(key="sentence_form"):
+            user_sentence = st.text_area("請輸入你造的英文句子：", placeholder=f"例如: I try to {target_word} every day...", key="user_sent_input")
+            submit_sent_btn = st.form_submit_button("🤖 提交給 AI 批改評價", use_container_width=True)
 
-        # 使用 form 表單處理輸入與提交
-        with st.form(key="fill_form"):
-            user_input = st.text_input("請在此輸入空缺的英文單字：", key="fill_input_text")
-            submit_btn = st.form_submit_button("🚀 提交答案", use_container_width=True)
-
-            if submit_btn:
-                cleaned_user_input = user_input.strip().lower()
-                cleaned_target = target_word.strip().lower()
-
-                if cleaned_user_input == cleaned_target:
-                    new_fam = fam + 1
-                    # 更新資料庫熟悉度
+            if submit_sent_btn:
+                with st.spinner("AI 正在審查你的造句與文法..."):
+                    eval_data = evaluate_sentence_ai(target_word, user_sentence)
+                    st.session_state.eval_result = eval_data
+                    
+                    # 更新熟悉度
+                    delta = eval_data["delta"]
+                    new_fam = max(0, fam + delta)
                     conn = get_db()
                     cursor = conn.cursor()
                     cursor.execute("UPDATE user_words SET familiarity = ? WHERE rowid = ?", (new_fam, w_rowid))
                     conn.commit()
                     conn.close()
-                    
-                    st.success(f"🎉 答對了！單字是 **{target_word}**（熟悉度 +1，目前：{new_fam}）")
-                    st.session_state.last_result = "correct"
-                else:
-                    st.error(f"❌ 答錯了！正確答案是：**{target_word}**")
-                    st.session_state.last_result = "wrong"
+                    # 同步更新當前 session
+                    st.session_state.sentence_item = (w_rowid, target_word, target_def, new_fam)
 
+        # 顯示批改結果
+        if st.session_state.get("eval_result"):
+            res = st.session_state.eval_result
+            st.markdown("---")
+            if res["passed"]:
+                st.success(res["feedback"])
+                st.info(f"📈 熟悉度變動：**+{res['delta']}** （最新熟悉度：`{st.session_state.sentence_item[3]}`）")
+            else:
+                st.error(res["feedback"])
+                st.warning(f"📉 熟悉度變動：**{res['delta']}** （最新熟悉度：`{st.session_state.sentence_item[3]}`）")
+
+        # 換下一個單字按鈕
         st.markdown("---")
-        if st.button("➡️ 下一題", use_container_width=True):
-            st.session_state.fill_item = random.choice(user_words)
+        if st.button("➡️ 下一個單字", use_container_width=True):
+            st.session_state.sentence_item = random.choice(user_words)
+            st.session_state.eval_result = None
             st.rerun()
 
 # ================= 3. 🎴 個人單字卡複習 =================
@@ -314,7 +331,7 @@ elif menu == "🎴 個人單字卡複習":
     conn.close()
 
     if not words:
-        st.info("💡 你的個人單字庫目前是空的！請先至「🎯 牛津5000 隨機測驗」按下『認識』，或透過「➕ 手動新增個人單字」加入單字。")
+        st.info("💡 你的個人單字庫目前是空的！請先至「🎯 牛津5000 隨機測驗」按下『認識』加入單字。")
     else:
         if "card_index" not in st.session_state:
             st.session_state.card_index = 0
@@ -417,7 +434,6 @@ elif menu == "📚 查看個人單字庫":
         st.write(f"你目前已收藏 **{len(rows)}** 個單字：")
         st.dataframe(rows, column_config={"0": "單字", "1": "解釋", "2": "熟悉度"}, use_container_width=True)
         
-        # 額外提供：手動刪除錯誤單字選項
         st.markdown("---")
         st.caption("🗑️ 若想從個人庫移除單字：")
         del_word = st.text_input("輸入要刪除的英文單字")

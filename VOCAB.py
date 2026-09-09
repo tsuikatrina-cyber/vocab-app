@@ -2,6 +2,7 @@ import streamlit as st
 import sqlite3
 import random
 import re
+import time
 from pathlib import Path
 import pypdf
 from deep_translator import GoogleTranslator
@@ -88,14 +89,16 @@ def load_oxford_to_db():
 def get_db():
     return sqlite3.connect(DB_FILE)
 
-@st.cache_data
+# 使用 cache_data 與 try-except 避免重複請求與 Error 500 報錯
+@st.cache_data(show_spinner=False)
 def get_translation(word):
-    """即時線上中文翻譯"""
+    """即時線上中文翻譯 (含防錯機制)"""
     try:
+        time.sleep(0.05)  # 微小延遲保護 API 限流
         translated = GoogleTranslator(source='auto', target='zh-TW').translate(word)
-        return translated
+        return translated if translated else "暫無翻譯"
     except Exception:
-        return "暫無翻譯"
+        return "暫無法取得翻譯"
 
 # 頁面配置與隱藏錨點圖示
 st.set_page_config(page_title="英文單字學習助手", page_icon="📖", layout="centered")
@@ -198,13 +201,13 @@ elif menu == "📗 牛津完整字詞庫":
     st.caption(f"牛津總詞庫共收錄 **{total_count}** 個單字：")
     st.dataframe(rows, column_config={"0": "英文單字", "1": "詞性 / 等級"}, use_container_width=True)
 
-# ================= 3. 個人單字卡複習 (改用 rowid，徹底解決報錯) =================
+# ================= 3. 個人單字卡複習 =================
 elif menu == "🎴 個人單字卡複習":
     st.subheader("🎴 個人單字卡複習")
     
     conn = get_db()
     cursor = conn.cursor()
-    # 使用 SQLite 的隱藏內建主鍵 rowid，不論有沒有 id 欄位都 100% 支援
+    # 使用 rowid 確保向下相容舊資料表
     cursor.execute("SELECT rowid, word, definition, familiarity FROM user_words ORDER BY familiarity ASC")
     words = cursor.fetchall()
     conn.close()

@@ -40,11 +40,10 @@ def init_db():
     if 'familiarity' not in columns:
         cursor.execute("ALTER TABLE user_words ADD COLUMN familiarity INTEGER DEFAULT 1")
 
-    # 關鍵：清理資料庫中之前存入的 Error 500 舊字串
+    # 清理資料庫中之前存入的 Error 500 舊字串
     cursor.execute("SELECT rowid, word, definition FROM user_words WHERE definition LIKE '%Error 500%' OR definition LIKE '%Server Error%'")
     bad_rows = cursor.fetchall()
     for rowid, word, old_def in bad_rows:
-        # 提取原本的詞性標籤 [n.] (C1) 等
         match = re.search(r'(\[.*?\]\s*\(.*?\))', old_def)
         pos_tag = match.group(1) if match else ""
         new_trans = get_translation(word)
@@ -105,7 +104,6 @@ def get_db():
 @st.cache_data(show_spinner=False)
 def get_translation(word):
     """即時線上中文翻譯 (含多重 API 備援與錯誤過濾)"""
-    # 1. 嘗試 Google Translator
     try:
         time.sleep(0.05)
         translated = GoogleTranslator(source='auto', target='zh-TW').translate(word)
@@ -114,7 +112,6 @@ def get_translation(word):
     except Exception:
         pass
 
-    # 2. 備援機制：MyMemory API
     try:
         url = f"https://api.mymemory.translated.net/get?q={word}&langpair=en|zh-TW"
         res = requests.get(url, timeout=3).json()
@@ -125,6 +122,29 @@ def get_translation(word):
         pass
 
     return "點擊字典查釋義"
+
+# 免費例句取得機制
+@st.cache_data(show_spinner=False)
+def get_example_sentence(word):
+    """自動取得包含目標單字的英文例句與中文翻譯"""
+    try:
+        url = f"https://api.dictionaryapi.dev/api/v2/entries/en/{word}"
+        res = requests.get(url, timeout=3).json()
+        if isinstance(res, list) and len(res) > 0:
+            meanings = res[0].get("meanings", [])
+            for m in meanings:
+                for defn in m.get("definitions", []):
+                    example = defn.get("example")
+                    if example and word.lower() in example.lower():
+                        example_cn = get_translation(example)
+                        return example, example_cn
+    except Exception:
+        pass
+    
+    # 備援預設例句
+    fallback_en = f"Can you remember the word '{word}' and fill it in?"
+    fallback_cn = f"你能記住『{word}』這個單字並將它填入嗎？"
+    return fallback_en, fallback_cn
 
 # 頁面配置與隱藏錨點圖示
 st.set_page_config(page_title="英文單字學習助手", page_icon="📖", layout="centered")
@@ -143,8 +163,9 @@ st.title("📖 英文單字學習助手")
 # 側邊欄選單
 menu = st.sidebar.radio("功能選單", [
     "🎯 牛津5000 隨機測驗",
-    "📗 牛津完整字詞庫",
+    "📝 填空記憶特訓",
     "🎴 個人單字卡複習",
+    "📗 牛津完整字詞庫",
     "➕ 手動新增個人單字",
     "📚 查看個人單字庫"
 ])
@@ -210,24 +231,53 @@ if menu == "🎯 牛津5000 隨機測驗":
             🔗 **線上查字典**：[{current_w} 在 Cambridge Dictionary]({cambridge_url})
             """)
 
-# ================= 2. 牛津完整字詞庫 =================
-elif menu == "📗 牛津完整字詞庫":
-    st.subheader("📗 牛津 3000 / 5000 完整字詞庫")
-    search_kw = st.text_input("🔍 搜尋牛津詞庫")
+# ================= 2. 📝 填空記憶特訓 (新功能) =================
+elif menu == "📝 填空記憶特訓":
+    st.subheader("📝 填空拼字記憶特訓")
+    st.write("考考你的實力！請靠記憶將正確的英文單字填入句子的空格中。")
+
     conn = get_db()
     cursor = conn.cursor()
-    if search_kw:
-        cursor.execute("SELECT word, definition FROM oxford_words WHERE word LIKE ? ORDER BY word ASC", (f"%{search_kw.lower()}%",))
-    else:
-        cursor.execute("SELECT word, definition FROM oxford_words ORDER BY word ASC LIMIT 200")
-    rows = cursor.fetchall()
-    cursor.execute("SELECT COUNT(*) FROM oxford_words")
-    total_count = cursor.fetchone()[0]
+    cursor.execute("SELECT word, definition FROM user_words")
+    user_words = cursor.fetchall()
     conn.close()
-    st.caption(f"牛津總詞庫共收錄 **{total_count}** 個單字：")
-    st.dataframe(rows, column_config={"0": "英文單字", "1": "詞性 / 等級"}, use_container_width=True)
 
-# ================= 3. 個人單字卡複習 =================
+    if not user_words:
+        st.info("💡 你的個人單字庫是空的！請先至「🎯 牛津5000 隨機測驗」加入單字後再來挑戰填空特訓。")
+    else:
+        if "fill_item" not in st.session_state:
+            st.session_state.fill_item = random.choice(user_words)
+            st.session_state.user_answer = ""
+            st.session_state.submitted = False
+
+        target_word, target_def = st.session_state.fill_item
+        example_en, example_cn = get_example_sentence(target_word)
+
+        # 把句子中的目標單字遮住，變成空格 ______
+        pattern = re.compile(re.escape(target_word), re.IGNORECASE)
+        blanked_sentence = pattern.sub("______", example_en)
+
+        st.markdown(f"#### 💬 請填空：")
+        st.info(f"### **{blanked_sentence}**")
+        st.caption(f"💡 中文句意提示：{example_cn}")
+        st.caption(f"🏷️ 單字釋義提示：{target_def}")
+
+        user_input = st.text_input("請在此輸入空缺的英文單字：", key="fill_input")
+
+        col1, col2 = st.columns(2)
+        with col1:
+            if st.button("🚀 提交答案", use_container_width=True):
+                if user_input.strip().lower() == target_word.strip().lower():
+                    st.success(f"🎉 太棒了！回答正確！答案就是 **{target_word}**")
+                else:
+                    st.error(f"❌ 答錯了！正確答案是：**{target_word}**（你輸入的是：`{user_input}`）")
+
+        with col2:
+            if st.button("➡️ 下一題", use_container_width=True):
+                st.session_state.fill_item = random.choice(user_words)
+                st.rerun()
+
+# ================= 3. 🎴 個人單字卡複習 =================
 elif menu == "🎴 個人單字卡複習":
     st.subheader("🎴 個人單字卡複習")
     
@@ -289,7 +339,24 @@ elif menu == "🎴 個人單字卡複習":
                 st.session_state.card_index = random.randint(0, len(words) - 1)
                 st.rerun()
 
-# ================= 4. 手動新增個人單字 =================
+# ================= 4. 牛津完整字詞庫 =================
+elif menu == "📗 牛津完整字詞庫":
+    st.subheader("📗 牛津 3000 / 5000 完整字詞庫")
+    search_kw = st.text_input("🔍 搜尋牛津詞庫")
+    conn = get_db()
+    cursor = conn.cursor()
+    if search_kw:
+        cursor.execute("SELECT word, definition FROM oxford_words WHERE word LIKE ? ORDER BY word ASC", (f"%{search_kw.lower()}%",))
+    else:
+        cursor.execute("SELECT word, definition FROM oxford_words ORDER BY word ASC LIMIT 200")
+    rows = cursor.fetchall()
+    cursor.execute("SELECT COUNT(*) FROM oxford_words")
+    total_count = cursor.fetchone()[0]
+    conn.close()
+    st.caption(f"牛津總詞庫共收錄 **{total_count}** 個單字：")
+    st.dataframe(rows, column_config={"0": "英文單字", "1": "詞性 / 等級"}, use_container_width=True)
+
+# ================= 5. 手動新增個人單字 =================
 elif menu == "➕ 手動新增個人單字":
     st.subheader("➕ 手動新增單字至個人庫")
     word = st.text_input("英文單字")
@@ -308,7 +375,7 @@ elif menu == "➕ 手動新增個人單字":
         else:
             st.error("請完整輸入單字與解釋！")
 
-# ================= 5. 查看個人單字庫 =================
+# ================= 6. 查看個人單字庫 =================
 elif menu == "📚 查看個人單字庫":
     st.subheader("📚 我的個人單字庫")
     search_kw = st.text_input("🔍 搜尋我的單字")

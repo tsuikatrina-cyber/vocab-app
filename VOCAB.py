@@ -100,7 +100,7 @@ def load_oxford_to_db():
 def get_db():
     return sqlite3.connect(DB_FILE)
 
-# 雙重備援翻譯機制：Google 失敗自動切換 MyMemory
+# 雙重備援翻譯機制
 @st.cache_data(show_spinner=False)
 def get_translation(word):
     """即時線上中文翻譯 (含多重 API 備援與錯誤過濾)"""
@@ -123,10 +123,11 @@ def get_translation(word):
 
     return "點擊字典查釋義"
 
-# 免費例句取得機制
+# 多重真實例句取得機制
 @st.cache_data(show_spinner=False)
 def get_example_sentence(word):
-    """自動取得包含目標單字的英文例句與中文翻譯"""
+    """自動取得真實英文例句（不含中文）"""
+    # 來源 1: Free Dictionary API
     try:
         url = f"https://api.dictionaryapi.dev/api/v2/entries/en/{word}"
         res = requests.get(url, timeout=3).json()
@@ -136,15 +137,29 @@ def get_example_sentence(word):
                 for defn in m.get("definitions", []):
                     example = defn.get("example")
                     if example and word.lower() in example.lower():
-                        example_cn = get_translation(example)
-                        return example, example_cn
+                        return example
     except Exception:
         pass
-    
-    # 備援預設例句
-    fallback_en = f"Can you remember the word '{word}' and fill it in?"
-    fallback_cn = f"你能記住『{word}』這個單字並將它填入嗎？"
-    return fallback_en, fallback_cn
+
+    # 來源 2: Datamuse API 語境搜尋
+    try:
+        url = f"https://api.datamuse.com/words?sp={word}&md=p&max=1"
+        res = requests.get(url, timeout=3).json()
+        if res and "defs" in res[0]:
+            for d in res[0]["defs"]:
+                parts = d.split("\t")
+                if len(parts) > 1 and word.lower() in parts[1].lower():
+                    return parts[1]
+    except Exception:
+        pass
+
+    # 備援自然句型（避免萬用問句）
+    templates = [
+        f"The {word} was described as very important in the modern context.",
+        f"She mentioned the word {word} during her presentation.",
+        f"Understanding the concept of {word} is essential for this subject."
+    ]
+    return random.choice(templates)
 
 # 頁面配置與隱藏錨點圖示
 st.set_page_config(page_title="英文單字學習助手", page_icon="📖", layout="centered")
@@ -231,51 +246,63 @@ if menu == "🎯 牛津5000 隨機測驗":
             🔗 **線上查字典**：[{current_w} 在 Cambridge Dictionary]({cambridge_url})
             """)
 
-# ================= 2. 📝 填空記憶特訓 (新功能) =================
+# ================= 2. 📝 填空記憶特訓 (純英文無中文提示 + 答對加熟悉度) =================
 elif menu == "📝 填空記憶特訓":
     st.subheader("📝 填空拼字記憶特訓")
-    st.write("考考你的實力！請靠記憶將正確的英文單字填入句子的空格中。")
+    st.write("請靠記憶將正確的英文單字填入句子的空格中（無中文提示）。")
 
     conn = get_db()
     cursor = conn.cursor()
-    cursor.execute("SELECT word, definition FROM user_words")
+    cursor.execute("SELECT rowid, word, definition, familiarity FROM user_words")
     user_words = cursor.fetchall()
     conn.close()
 
     if not user_words:
-        st.info("💡 你的個人單字庫是空的！請先至「🎯 牛津5000 隨機測驗」加入單字後再來挑戰填空特訓。")
+        st.info("💡 你的個人單字庫是空的！請先至「🎯 牛津5000 隨機測驗」加入你認識的單字後再來挑戰。")
     else:
         if "fill_item" not in st.session_state:
             st.session_state.fill_item = random.choice(user_words)
-            st.session_state.user_answer = ""
             st.session_state.submitted = False
+            st.session_state.last_result = None
 
-        target_word, target_def = st.session_state.fill_item
-        example_en, example_cn = get_example_sentence(target_word)
+        w_rowid, target_word, target_def, fam = st.session_state.fill_item
+        example_en = get_example_sentence(target_word)
 
-        # 把句子中的目標單字遮住，變成空格 ______
-        pattern = re.compile(re.escape(target_word), re.IGNORECASE)
+        # 將例句中的目標單字（含大小寫與單複數形式）替換為空格 ______
+        pattern = re.compile(re.escape(target_word) + r'(s|es|d|ed|ing)?', re.IGNORECASE)
         blanked_sentence = pattern.sub("______", example_en)
 
         st.markdown(f"#### 💬 請填空：")
         st.info(f"### **{blanked_sentence}**")
-        st.caption(f"💡 中文句意提示：{example_cn}")
-        st.caption(f"🏷️ 單字釋義提示：{target_def}")
 
-        user_input = st.text_input("請在此輸入空缺的英文單字：", key="fill_input")
+        # 使用 form 表單處理輸入與提交
+        with st.form(key="fill_form"):
+            user_input = st.text_input("請在此輸入空缺的英文單字：", key="fill_input_text")
+            submit_btn = st.form_submit_button("🚀 提交答案", use_container_width=True)
 
-        col1, col2 = st.columns(2)
-        with col1:
-            if st.button("🚀 提交答案", use_container_width=True):
-                if user_input.strip().lower() == target_word.strip().lower():
-                    st.success(f"🎉 太棒了！回答正確！答案就是 **{target_word}**")
+            if submit_btn:
+                cleaned_user_input = user_input.strip().lower()
+                cleaned_target = target_word.strip().lower()
+
+                if cleaned_user_input == cleaned_target:
+                    new_fam = fam + 1
+                    # 更新資料庫熟悉度
+                    conn = get_db()
+                    cursor = conn.cursor()
+                    cursor.execute("UPDATE user_words SET familiarity = ? WHERE rowid = ?", (new_fam, w_rowid))
+                    conn.commit()
+                    conn.close()
+                    
+                    st.success(f"🎉 答對了！單字是 **{target_word}**（熟悉度 +1，目前：{new_fam}）")
+                    st.session_state.last_result = "correct"
                 else:
-                    st.error(f"❌ 答錯了！正確答案是：**{target_word}**（你輸入的是：`{user_input}`）")
+                    st.error(f"❌ 答錯了！正確答案是：**{target_word}**")
+                    st.session_state.last_result = "wrong"
 
-        with col2:
-            if st.button("➡️ 下一題", use_container_width=True):
-                st.session_state.fill_item = random.choice(user_words)
-                st.rerun()
+        st.markdown("---")
+        if st.button("➡️ 下一題", use_container_width=True):
+            st.session_state.fill_item = random.choice(user_words)
+            st.rerun()
 
 # ================= 3. 🎴 個人單字卡複習 =================
 elif menu == "🎴 個人單字卡複習":

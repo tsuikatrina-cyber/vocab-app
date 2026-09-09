@@ -12,7 +12,6 @@ DB_FILE = "vocab_app.db"
 PDF_FILES = ["American_Oxford_3000.pdf", "American_Oxford_5000.pdf"]
 
 def init_db():
-    """初始化資料表，清理無效欄位與備用字串"""
     conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
     
@@ -88,7 +87,6 @@ def get_db():
 
 @st.cache_data(show_spinner=False)
 def get_translation(word):
-    """取得單字中文翻譯"""
     try:
         time.sleep(0.05)
         translated = GoogleTranslator(source='auto', target='zh-TW').translate(word)
@@ -98,26 +96,32 @@ def get_translation(word):
         pass
     return "查無翻譯"
 
+def get_smart_placeholder(target_word, definition):
+    """根據詞性給出合理的提示例句"""
+    defn = definition.lower()
+    if '[n.]' in defn or 'n.' in defn:
+        return f"例如: Learning about {target_word} is important for us..."
+    elif '[v.]' in defn or 'v.' in defn:
+        return f"例如: I try to {target_word} whenever I have free time..."
+    elif '[adj.]' in defn or 'adj.' in defn:
+        return f"例如: It was a very {target_word} moment for everyone..."
+    else:
+        return f"請輸入包含 『{target_word}』 的完整英文句子..."
+
 def evaluate_sentence_ai(target_word, user_sentence):
-    """
-    AI 造句評價系統：
-    檢查是否包含單字、文法檢查（LanguageTool API）、給予意見與經驗值加減
-    """
     sentence = user_sentence.strip()
     if not sentence:
         return {"passed": False, "score": 0, "feedback": "⚠️ 內容不能為空，請輸入句子！", "delta": 0}
     
-    # 檢查是否含有目標單字（允許單複數、時態變化）
     pattern = re.compile(re.escape(target_word) + r'(s|es|d|ed|ing)?', re.IGNORECASE)
     if not pattern.search(sentence):
         return {
             "passed": False,
             "score": 0,
-            "feedback": f"❌ 你的句子中沒有包含單字 **{target_word}**（或其變形），請重新調整！",
+            "feedback": f"❌ 你的句子中沒有包含單字 **{target_word}**（或其變化型），請重新調整！",
             "delta": -1
         }
     
-    # 使用免費開源 LanguageTool API 進行文法檢測
     try:
         response = requests.post(
             "https://api.languagetool.org/v2/check",
@@ -127,7 +131,6 @@ def evaluate_sentence_ai(target_word, user_sentence):
         data = response.json()
         matches = data.get("matches", [])
         
-        # 過濾純大小寫/標點符號的輕微警示，計算重大文法錯誤數
         critical_errors = [m for m in matches if m.get("rule", {}).get("issueType") in ["misspelling", "grammar"]]
         
         if len(critical_errors) == 0:
@@ -149,12 +152,11 @@ def evaluate_sentence_ai(target_word, user_sentence):
             return {
                 "passed": False,
                 "score": 60,
-                "feedback": f"⚠️ **單字使用正確，但文法有些小瑕疵：**\n\n{sugg_text}\n\n- 再調整一下句子讓表達更完美吧！",
+                "feedback": f"⚠️ **單字使用正確，但文法有些小瑕疵：**\n\n{sugg_text}\n\n- 再調整一下句子讓表達更完整吧！",
                 "delta": -1
             }
             
     except Exception:
-        # 網路介面連線備援機制
         words_count = len(sentence.split())
         if words_count >= 4:
             return {
@@ -171,7 +173,6 @@ def evaluate_sentence_ai(target_word, user_sentence):
                 "delta": -1
             }
 
-# 頁面配置與隱藏錨點圖示
 st.set_page_config(page_title="英文單字學習助手", page_icon="📖", layout="centered")
 st.markdown("""
 <style>
@@ -185,7 +186,6 @@ load_oxford_to_db()
 
 st.title("📖 英文單字學習助手")
 
-# 側邊欄選單
 menu = st.sidebar.radio("功能選單", [
     "🎯 牛津5000 隨機測驗",
     "✍️ AI 英文造句特訓",
@@ -256,7 +256,7 @@ if menu == "🎯 牛津5000 隨機測驗":
             🔗 **線上查字典**：[{current_w} 在 Cambridge Dictionary]({cambridge_url})
             """)
 
-# ================= 2. ✍️ AI 英文造句特訓 (全新設計) =================
+# ================= 2. ✍️ AI 英文造句特訓 =================
 elif menu == "✍️ AI 英文造句特訓":
     st.subheader("✍️ AI 英文造句實戰特訓")
     st.write("從你的個人單字庫隨機抽出一個單字，請嘗試用它造一個完整的英文句子！AI 將會即時為你的句子提供建議並調整熟悉度。")
@@ -270,7 +270,6 @@ elif menu == "✍️ AI 英文造句特訓":
     if not user_words:
         st.info("💡 你的個人單字庫目前是空的！請先至「🎯 牛津5000 隨機測驗」按下『認識』加入單字。")
     else:
-        # 初始化造句題目
         if "sentence_item" not in st.session_state:
             st.session_state.sentence_item = random.choice(user_words)
             st.session_state.eval_result = None
@@ -281,9 +280,11 @@ elif menu == "✍️ AI 英文造句特訓":
         st.markdown(f"### 🎯 請用單字： **`{target_word}`** 造句")
         st.caption(f"📖 單字釋義：{target_def} ｜ ⭐ 目前熟悉度：`{fam}`")
 
-        # 使用 form 表單輸入造句
+        # 動態生成正確對應詞性的預設提示
+        placeholder_text = get_smart_placeholder(target_word, target_def)
+
         with st.form(key="sentence_form"):
-            user_sentence = st.text_area("請輸入你造的英文句子：", placeholder=f"例如: I try to {target_word} every day...", key="user_sent_input")
+            user_sentence = st.text_area("請輸入你造的英文句子：", placeholder=placeholder_text, key="user_sent_input")
             submit_sent_btn = st.form_submit_button("🤖 提交給 AI 批改評價", use_container_width=True)
 
             if submit_sent_btn:
@@ -291,7 +292,6 @@ elif menu == "✍️ AI 英文造句特訓":
                     eval_data = evaluate_sentence_ai(target_word, user_sentence)
                     st.session_state.eval_result = eval_data
                     
-                    # 更新熟悉度
                     delta = eval_data["delta"]
                     new_fam = max(0, fam + delta)
                     conn = get_db()
@@ -299,10 +299,8 @@ elif menu == "✍️ AI 英文造句特訓":
                     cursor.execute("UPDATE user_words SET familiarity = ? WHERE rowid = ?", (new_fam, w_rowid))
                     conn.commit()
                     conn.close()
-                    # 同步更新當前 session
                     st.session_state.sentence_item = (w_rowid, target_word, target_def, new_fam)
 
-        # 顯示批改結果
         if st.session_state.get("eval_result"):
             res = st.session_state.eval_result
             st.markdown("---")
@@ -313,7 +311,6 @@ elif menu == "✍️ AI 英文造句特訓":
                 st.error(res["feedback"])
                 st.warning(f"📉 熟悉度變動：**{res['delta']}** （最新熟悉度：`{st.session_state.sentence_item[3]}`）")
 
-        # 換下一個單字按鈕
         st.markdown("---")
         if st.button("➡️ 下一個單字", use_container_width=True):
             st.session_state.sentence_item = random.choice(user_words)

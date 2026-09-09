@@ -3,6 +3,7 @@ import sqlite3
 import random
 import re
 import time
+import requests
 from pathlib import Path
 import pypdf
 from deep_translator import GoogleTranslator
@@ -11,7 +12,7 @@ DB_FILE = "vocab_app.db"
 PDF_FILES = ["American_Oxford_3000.pdf", "American_Oxford_5000.pdf"]
 
 def init_db():
-    """初始化資料表，自動補齊舊資料庫缺少的欄位"""
+    """初始化資料表，並清理舊有含有 Error 500 的壞資料"""
     conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
     
@@ -38,6 +39,17 @@ def init_db():
     columns = [column[1] for column in cursor.fetchall()]
     if 'familiarity' not in columns:
         cursor.execute("ALTER TABLE user_words ADD COLUMN familiarity INTEGER DEFAULT 1")
+
+    # 關鍵：清理資料庫中之前存入的 Error 500 舊字串
+    cursor.execute("SELECT rowid, word, definition FROM user_words WHERE definition LIKE '%Error 500%' OR definition LIKE '%Server Error%'")
+    bad_rows = cursor.fetchall()
+    for rowid, word, old_def in bad_rows:
+        # 提取原本的詞性標籤 [n.] (C1) 等
+        match = re.search(r'(\[.*?\]\s*\(.*?\))', old_def)
+        pos_tag = match.group(1) if match else ""
+        new_trans = get_translation(word)
+        new_def = f"{new_trans} {pos_tag}".strip()
+        cursor.execute("UPDATE user_words SET definition = ? WHERE rowid = ?", (new_def, rowid))
 
     conn.commit()
     conn.close()
@@ -89,21 +101,30 @@ def load_oxford_to_db():
 def get_db():
     return sqlite3.connect(DB_FILE)
 
-# 使用 cache_data 與強效防錯機制，徹底攔截 Error 500 訊息
+# 雙重備援翻譯機制：Google 失敗自動切換 MyMemory
 @st.cache_data(show_spinner=False)
 def get_translation(word):
-    """即時線上中文翻譯 (含 Error 500 攔截機制)"""
+    """即時線上中文翻譯 (含多重 API 備援與錯誤過濾)"""
+    # 1. 嘗試 Google Translator
     try:
-        time.sleep(0.1)  # 微小延遲保護 API
+        time.sleep(0.05)
         translated = GoogleTranslator(source='auto', target='zh-TW').translate(word)
-        
-        # 關鍵攔截：若 Google 回傳包含 Error 500 或 HTML 錯誤標籤，直接過濾掉
-        if not translated or "Error 500" in translated or "Server Error" in translated or "<html" in translated.lower():
-            return "暫無法取得翻譯 (請重試)"
-            
-        return translated
+        if translated and "Error 500" not in translated and "Server Error" not in translated and "<html" not in translated.lower():
+            return translated
     except Exception:
-        return "暫無法取得翻譯 (請重試)"
+        pass
+
+    # 2. 備援機制：MyMemory API
+    try:
+        url = f"https://api.mymemory.translated.net/get?q={word}&langpair=en|zh-TW"
+        res = requests.get(url, timeout=3).json()
+        translated = res.get("responseData", {}).get("translatedText", "")
+        if translated and "QUERY LENGTH LIMIT EXCEEDED" not in translated.upper() and "MYMEMORY" not in translated.upper():
+            return translated
+    except Exception:
+        pass
+
+    return "點擊字典查釋義"
 
 # 頁面配置與隱藏錨點圖示
 st.set_page_config(page_title="英文單字學習助手", page_icon="📖", layout="centered")
@@ -212,7 +233,6 @@ elif menu == "🎴 個人單字卡複習":
     
     conn = get_db()
     cursor = conn.cursor()
-    # 使用 rowid 確保向下相容舊資料表
     cursor.execute("SELECT rowid, word, definition, familiarity FROM user_words ORDER BY familiarity ASC")
     words = cursor.fetchall()
     conn.close()
